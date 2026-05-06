@@ -88,11 +88,11 @@ func (ib *Inbox) ProcessBatch(ctx context.Context, consumerGroup string, size in
 		if err := handler(ctx, msg); err != nil {
 			ib.handleRetry(ctx, msg, err)
 		} else {
-			now := time.Now()
-			if markErr := ib.store.markDone(ctx, msg.ID, now, "processed_at"); markErr == nil {
-				_ = ib.store.archiveByID(ctx, msg.ID, "PROCESSED")
+			if archErr := ib.store.markDoneAndArchive(ctx, msg.ID, time.Now(), "processed_at", "PROCESSED"); archErr == nil {
 				ib.metrics.InboxProcessed(msg.ConsumerGroup, msg.EventType)
 			}
+			// On archive failure the row stays CLAIMED; Cleanup.RecoverStuckInbox
+			// will reset it and the (idempotent) handler will run again.
 		}
 		processed++
 	}

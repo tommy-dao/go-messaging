@@ -19,6 +19,7 @@ type Status string
 const (
 	StatusPending Status = "PENDING"
 	StatusClaimed Status = "CLAIMED"
+	StatusRetry   Status = "RETRY"
 	StatusDone    Status = "DONE"
 	StatusFailed  Status = "FAILED"
 )

@@ -136,14 +136,50 @@ func (s *store) claimBatch(ctx context.Context, direction Direction, consumerGro
 	return scanMessages(rows)
 }
 
-// markDone marks a message as done.
-func (s *store) markDone(ctx context.Context, id int64, ts time.Time, field string) error {
-	query := fmt.Sprintf(`UPDATE %s SET status = 'DONE', %s = $2 WHERE id = $1`, s.hotTbl, field)
-	_, err := s.db.ExecContext(ctx, query, id, ts)
+// markDoneAndArchive atomically marks a message DONE, copies it to the archive
+// table, and deletes it from the hot table — all within a single transaction.
+//
+// Combining these steps prevents an orphan-DONE row in the hot table if the
+// archive step fails: on rollback the row stays in its CLAIMED state, so
+// Cleanup.RecoverStuck* will eventually reset it to RETRY and a worker will
+// re-process it. (Handlers must be idempotent — see README.)
+func (s *store) markDoneAndArchive(ctx context.Context, id int64, ts time.Time, tsField, finalStatus string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return fmt.Errorf("message: archive begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	updateSQL := fmt.Sprintf(`UPDATE %s SET status = 'DONE', %s = $2 WHERE id = $1`, s.hotTbl, tsField)
+	if _, err := tx.ExecContext(ctx, updateSQL, id, ts); err != nil {
 		return fmt.Errorf("message: mark done: %w", err)
 	}
-	return nil
+
+	insertSQL := fmt.Sprintf(`INSERT INTO %s
+		(direction, consumer_group, message_id, event_id, event_type, payload, headers, source,
+		 final_status, retry_count, created_at, processed_at, published_at, last_error)
+		SELECT direction, consumer_group, message_id, event_id, event_type, payload, headers, source,
+		       $2, retry_count, created_at, processed_at, published_at, last_error
+		FROM %s WHERE id = $1`, s.archTbl, s.hotTbl)
+
+	result, err := tx.ExecContext(ctx, insertSQL, id, finalStatus)
+	if err != nil {
+		return fmt.Errorf("message: archive insert: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("message: archive rows affected: %w", err)
+	}
+	if rows == 0 {
+		return ErrNotFound
+	}
+
+	deleteSQL := fmt.Sprintf(`DELETE FROM %s WHERE id = $1`, s.hotTbl)
+	if _, err := tx.ExecContext(ctx, deleteSQL, id); err != nil {
+		return fmt.Errorf("message: archive delete: %w", err)
+	}
+
+	return tx.Commit()
 }
 
 // markRetry sets the message to retry status with the next retry time.

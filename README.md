@@ -13,10 +13,6 @@ It provides:
 
 Both Inbox and Outbox share the same set of database tables (`message_hot`, `message_archive`), differentiated by a `direction` column. Table names can be prefixed for multi-service isolation.
 
-> **Module path:** `github.com/tommy-dao/go-message`
-> **Go version:** 1.25+
-> **Database:** PostgreSQL (uses `FOR UPDATE SKIP LOCKED`, `JSONB`)
-
 ---
 
 ## Why this library
@@ -84,9 +80,9 @@ Everything the caller touches — at a glance.
 
 | Method                                                       | File                       | What it does                                                  |
 | ------------------------------------------------------------ | -------------------------- | ------------------------------------------------------------- |
-| [`m.Cleanup.PurgeExpiredDedup(ctx)`](#one-shot)              | [cleanup.go](cleanup.go)   | Delete dedup rows past `expire_at`.                           |
-| [`m.Cleanup.RecoverStuckInbox(ctx)`](#one-shot)              | [cleanup.go](cleanup.go)   | Flip stale `CLAIMED` inbox rows back to `RETRY`.              |
-| [`m.Cleanup.RecoverStuckOutbox(ctx)`](#one-shot)             | [cleanup.go](cleanup.go)   | Same for outbox.                                              |
+| [`m.Cleanup.PurgeExpiredDedup(ctx)`](#purge-expired-dedup)   | [cleanup.go](cleanup.go)   | Delete dedup rows past `expire_at`.                           |
+| [`m.Cleanup.RecoverStuckInbox(ctx)`](#recover-stuck-claims)  | [cleanup.go](cleanup.go)   | Flip stale `CLAIMED` inbox rows back to `RETRY`.              |
+| [`m.Cleanup.RecoverStuckOutbox(ctx)`](#recover-stuck-claims) | [cleanup.go](cleanup.go)   | Same for outbox.                                              |
 
 ### Options (passed to `New`)
 
@@ -102,14 +98,6 @@ Everything the caller touches — at a glance.
 | [`FixedBackoff{Interval}`](#backoff-strategies)                                   | [backoff.go](backoff.go)   | `Interval`                                      |
 | [`LinearBackoff{BaseDelay}`](#backoff-strategies)                                 | [backoff.go](backoff.go)   | `BaseDelay * retryCount`                        |
 | [`ExponentialBackoff{BaseDelay, MaxDelay}`](#example-using-a-built-in-strategy)   | [backoff.go](backoff.go)   | `min(BaseDelay * 2^(retryCount-1), MaxDelay)`   |
-
-### Sentinel errors
-
-| Error                              | File                     | When                                                                 |
-| ---------------------------------- | ------------------------ | -------------------------------------------------------------------- |
-| [`ErrDuplicate`](#errors)          | [errors.go](errors.go)   | Dedup key already exists. `Receive` swallows this and returns `nil`. |
-| [`ErrMaxRetry`](#errors)           | [errors.go](errors.go)   | Message has exceeded `MaxRetries`.                                   |
-| [`ErrNotFound`](#errors)           | [errors.go](errors.go)   | Requested message was not found.                                     |
 
 ---
 
@@ -166,6 +154,47 @@ m := message.New(db, cfg)
 // m.Inbox, m.Outbox, m.Cleanup are ready to use
 ```
 
+### 3. A quick round-trip
+
+Receive an inbound message, process it, add an outbound event, and publish it — the four calls that anchor the whole library:
+
+```go
+ctx := context.Background()
+
+// 1. Inbound: idempotently store
+m.Inbox.Receive(ctx, message.InboxMessage{
+    ConsumerGroup: "billing-service",
+    MessageID:     "msg-1",
+    EventType:     "order.created",
+    Payload:       []byte(`{"order_id":1}`),
+})
+
+// 2. Process the inbox (handler returns nil → archive PROCESSED)
+m.Inbox.ProcessBatch(ctx, "billing-service", 10,
+    func(ctx context.Context, msg *message.Message) error {
+        log.Printf("got %s: %s", msg.EventType, msg.Payload)
+        return nil
+    })
+
+// 3. Outbound: add an event inside your business transaction
+tx, _ := db.BeginTx(ctx, nil)
+m.Outbox.Add(ctx, tx, message.OutboxEvent{
+    EventID:   "evt-1",
+    EventType: "order.confirmed",
+    Payload:   []byte(`{"order_id":1}`),
+})
+tx.Commit()
+
+// 4. Publish (publisher returns nil → archive PUBLISHED)
+m.Outbox.PublishBatch(ctx, 10,
+    func(ctx context.Context, msg *message.Message) error {
+        log.Printf("publishing %s", msg.EventType)
+        return nil
+    })
+```
+
+For production patterns (worker loops, Kafka integration, error handling, scaling) jump to [Inbox usage](#inbox-usage), [Outbox usage](#outbox-usage), and [End-to-end Kafka example](#end-to-end-kafka-example).
+
 ---
 
 ## Inbox usage
@@ -188,17 +217,85 @@ err := m.Inbox.Receive(ctx, message.InboxMessage{
 
 `ProcessBatch` claims up to N pending/retry messages for the given consumer group, runs your handler on each, then archives successes or schedules retries on failure.
 
+#### Single call
+
 ```go
 processed, err := m.Inbox.ProcessBatch(ctx, "order-service", 50,
     func(ctx context.Context, msg *message.Message) error {
-        return doBusinessLogic(ctx, msg.Payload)
+        return doBusinessLogic(ctx, msg.Payload) // your own function
     },
 )
 ```
 
-The claim uses `FOR UPDATE SKIP LOCKED`, so multiple workers (or pods) can call `ProcessBatch` simultaneously and each will get a disjoint set of rows.
+#### Worker loop (typical production setup)
 
-Run it on whatever schedule you like — every second in a `time.Ticker`, on every HTTP poll, on a Kubernetes CronJob, etc.
+Usually you want `ProcessBatch` running continuously. Drive it with a ticker:
+
+```go
+import (
+    "context"
+    "encoding/json"
+    "errors"
+    "log"
+    "time"
+
+    message "github.com/tommy-dao/go-message"
+)
+
+type OrderCreated struct {
+    OrderID int64   `json:"order_id"`
+    Total   float64 `json:"total"`
+}
+
+func startInboxWorker(ctx context.Context, m *message.Messaging, group string) {
+    handler := func(ctx context.Context, msg *message.Message) error {
+        switch msg.EventType {
+        case "order.created":
+            var evt OrderCreated
+            if err := json.Unmarshal(msg.Payload, &evt); err != nil {
+                // Bad payload — return error so it retries; will eventually hit
+                // MaxRetries and be archived as FAILED for human inspection.
+                return errors.Join(errors.New("bad payload"), err)
+            }
+            return chargeCustomer(ctx, evt.OrderID, evt.Total) // your business logic
+
+        default:
+            log.Printf("inbox: unknown event %q, skipping", msg.EventType)
+            return nil // no-op → archive as PROCESSED
+        }
+    }
+
+    go func() {
+        t := time.NewTicker(time.Second)
+        defer t.Stop()
+        for {
+            select {
+            case <-ctx.Done():
+                return
+            case <-t.C:
+                if _, err := m.Inbox.ProcessBatch(ctx, group, 50, handler); err != nil {
+                    log.Printf("inbox: process batch: %v", err)
+                }
+            }
+        }
+    }()
+}
+```
+
+#### Handler return-value semantics
+
+| Return       | Effect                                                                          |
+| ------------ | ------------------------------------------------------------------------------- |
+| `nil`        | Success → row archived as `PROCESSED`; never re-delivered.                      |
+| `error`      | Failure → row flipped to `RETRY` with backoff; retried on a future tick.        |
+| `error` after `MaxRetries` retries | Archived as `FAILED` (so `MaxRetries=5` yields 6 total attempts: the initial try + 5 retries). `Metrics.InboxFailed` is counted; no more retries. |
+| Handler panics | Goroutine dies — row stays `CLAIMED` until `Cleanup.RecoverStuckInbox` resets it. **Wrap in `recover()` if you don't trust the handler.** |
+
+The handler **must be idempotent**: the same message can be delivered more than once if a worker crashes mid-handler (after the row was claimed but before it was archived).
+
+#### Scaling
+
+The claim uses `FOR UPDATE SKIP LOCKED`, so multiple goroutines (or pods) can call `ProcessBatch` concurrently — each gets a disjoint set of rows. Scale by running the worker on multiple replicas, or starting N goroutines in the same process. The database serializes claim transactions, so workers never see the same row.
 
 ---
 
@@ -254,30 +351,150 @@ Prefer `Add` whenever you *do* have a business transaction — that's the whole 
 ```go
 published, err := m.Outbox.PublishBatch(ctx, 100,
     func(ctx context.Context, msg *message.Message) error {
-        return kafkaProducer.Send(ctx, msg.EventType, msg.Payload)
+        return kafkaProducer.Send(ctx, msg.EventType, msg.Payload) // your own client
     },
 )
 ```
 
-Same `FOR UPDATE SKIP LOCKED` semantics — many relay workers can run in parallel.
+Same `FOR UPDATE SKIP LOCKED` semantics — many relay workers can run in parallel. Returning an error from the publisher closure flips the row to `RETRY` with the configured backoff; the message stays in `*_message_hot` until it succeeds or hits `MaxRetries`.
+
+For a complete worked example, see [End-to-end Kafka example](#end-to-end-kafka-example) below.
+
+---
+
+## End-to-end Kafka example
+
+A complete producer + consumer setup using [`segmentio/kafka-go`](https://github.com/segmentio/kafka-go). The same pattern works for any broker (NATS, RabbitMQ, SQS, …) — only the publisher/reader call changes.
+
+### Producer side — relaying outbox events to Kafka
+
+```go
+import (
+    "context"
+    "log"
+    "time"
+
+    "github.com/segmentio/kafka-go"
+    message "github.com/tommy-dao/go-message"
+)
+
+func startRelay(ctx context.Context, m *message.Messaging) {
+    writer := &kafka.Writer{
+        Addr:         kafka.TCP("kafka:9092"),
+        Balancer:     &kafka.Hash{},        // partition by key → per-entity ordering
+        RequiredAcks: kafka.RequireAll,     // strongest durability
+    }
+    defer writer.Close()
+
+    publisher := func(ctx context.Context, msg *message.Message) error {
+        headers := make([]kafka.Header, 0, len(msg.Headers))
+        for k, v := range msg.Headers {
+            headers = append(headers, kafka.Header{Key: k, Value: []byte(v)})
+        }
+        return writer.WriteMessages(ctx, kafka.Message{
+            Topic:   topicFor(msg.EventType),   // your mapping, e.g. "order.created" → "orders"
+            Key:     []byte(msg.EventID),       // same entity → same partition
+            Value:   msg.Payload,
+            Headers: headers,
+        })
+    }
+
+    go func() {
+        t := time.NewTicker(time.Second)
+        defer t.Stop()
+        for {
+            select {
+            case <-ctx.Done():
+                return
+            case <-t.C:
+                if _, err := m.Outbox.PublishBatch(ctx, 100, publisher); err != nil {
+                    log.Printf("publish batch: %v", err)
+                }
+            }
+        }
+    }()
+}
+```
+
+Key design choices:
+
+- **`EventID` as Kafka key**: events for the same business entity hash to the same partition, preserving per-entity ordering downstream. (Inbox messages use `MessageID` as the dedup key; outbox events use `EventID` — pick the field that's populated for your direction.)
+- **`Headers` propagation**: trace IDs, correlation IDs, schema versions — anything you set on `OutboxEvent.Headers` flows through unchanged.
+- **`RequiredAcks: RequireAll`** + at-least-once outbox = downstream consumers must dedupe by `EventID` (the consumer side below does this automatically via `Inbox`).
+- **Returning error = retry**: broker outage doesn't lose messages — they queue in the hot table and drain when Kafka recovers.
+
+### Consumer side — receiving from Kafka into the inbox
+
+```go
+reader := kafka.NewReader(kafka.ReaderConfig{
+    Brokers: []string{"kafka:9092"},
+    Topic:   "orders",
+    GroupID: "billing-service",
+})
+defer reader.Close()
+
+for {
+    msg, err := reader.ReadMessage(ctx)
+    if err != nil {
+        return err
+    }
+
+    headers := make(map[string]string, len(msg.Headers))
+    for _, h := range msg.Headers {
+        headers[h.Key] = string(h.Value)
+    }
+
+    err = m.Inbox.Receive(ctx, message.InboxMessage{
+        ConsumerGroup: "billing-service",
+        MessageID:     string(msg.Key),     // dedup key — redeliveries no-op
+        EventType:     msg.Topic,
+        Payload:       msg.Value,
+        Headers:       headers,
+        Source:        "kafka",
+    })
+    if err != nil {
+        return err
+    }
+}
+```
+
+The Kafka consumer **only stores** into the inbox — actual processing runs separately via [`m.Inbox.ProcessBatch`](#processing-a-batch) on its own ticker. This split is what makes the pattern robust:
+
+- Crash mid-processing → message stays in `*_message_hot`, picked up on restart.
+- Kafka rebalance → same offset re-delivered → dedup table no-ops the duplicate.
+- Scale consumer goroutine and processor goroutine independently.
+- Retry processing without re-reading from Kafka.
 
 ---
 
 ## Cleanup
 
-The library does **not** start its own goroutines. Wire these into your scheduler.
+The library does **not** start its own goroutines. If a worker crashes mid-process, its rows stay in `CLAIMED` status — `RecoverStuckInbox` / `RecoverStuckOutbox` flip them back to `RETRY` so another worker can pick them up. Dedup rows accumulate over time and need pruning. Wire these three methods into your own scheduler.
 
-### One-shot
+### Purge expired dedup
+
+Deletes dedup rows whose `expire_at` is past (driven by `Config.DedupTTL`). Returns the number of rows deleted.
 
 ```go
-purged, _   := m.Cleanup.PurgeExpiredDedup(ctx)   // delete dedup rows past expire_at
-recoveredIn, _  := m.Cleanup.RecoverStuckInbox(ctx)  // reset CLAIMED rows older than ClaimTimeout
-recoveredOut, _ := m.Cleanup.RecoverStuckOutbox(ctx)
-log.Printf("cleanup: purged=%d, recoveredInbox=%d, recoveredOutbox=%d",
-    purged, recoveredIn, recoveredOut)
+purged, _ := m.Cleanup.PurgeExpiredDedup(ctx)
+log.Printf("cleanup: purged %d dedup rows", purged)
 ```
 
-### Periodic (ticker)
+### Recover stuck claims
+
+Resets rows that have been `CLAIMED` longer than `Config.ClaimTimeout`. Returns the count.
+
+```go
+inbox, _  := m.Cleanup.RecoverStuckInbox(ctx)
+outbox, _ := m.Cleanup.RecoverStuckOutbox(ctx)
+log.Printf("cleanup: recovered inbox=%d outbox=%d", inbox, outbox)
+```
+
+### Running on a schedule
+
+Pick the pattern that fits your deployment.
+
+#### In-process ticker
 
 ```go
 go func() {
@@ -296,35 +513,26 @@ go func() {
 }()
 ```
 
-### Kubernetes CronJob (alternative)
+#### Kubernetes CronJob (out-of-process)
 
-If you'd rather not run an in-process goroutine, build a tiny binary that calls the three methods once and exits, and schedule it as a `CronJob`. The library is stateless across calls.
-
-If a worker crashes mid-process, its rows stay in `CLAIMED` status. `RecoverStuckInbox` / `RecoverStuckOutbox` flip them back to `RETRY` so another worker can pick them up.
+If you'd rather not run an in-process goroutine, build a tiny binary that calls the three methods once and exits, and schedule it as a `CronJob`. The library is stateless across calls — safe to run from anywhere with database access.
 
 ---
 
 ## Configuration reference
 
-Defined in [config.go](config.go).
+`Config` fields (defined in [config.go](config.go)):
 
-| Field               | Default                              | Purpose                                                  |
-| ------------------- | ------------------------------------ | -------------------------------------------------------- |
-| `TablePrefix`       | `""`                                 | Prefix for all tables (e.g. `"order"` → `order_message_hot`). |
+| Field               | Default                              | Purpose                                                              |
+| ------------------- | ------------------------------------ | -------------------------------------------------------------------- |
+| `TablePrefix`       | `""`                                 | Prefix for all tables (e.g. `"order"` → `order_message_hot`).        |
 | `DefaultMaxRetries` | `5`                                  | Used when `InboxMessage.MaxRetries` / `OutboxEvent.MaxRetries` is 0. |
-| `DefaultBackoff`    | `LinearBackoff{BaseDelay: 1s}`       | Strategy used when no `WithBackoff` option is passed.    |
-| `ClaimTimeout`      | `5m`                                 | Stuck-claim recovery threshold.                          |
-| `DedupTTL`          | `24h`                                | How long dedup rows live before being purged.            |
-| `WorkerID`          | `"default"`                          | Written into `claimed_by`. Useful for debugging.         |
+| `DefaultBackoff`    | `LinearBackoff{BaseDelay: 1s}`       | Strategy used when no `WithBackoff` option is passed.                |
+| `ClaimTimeout`      | `5m`                                 | Stuck-claim recovery threshold.                                      |
+| `DedupTTL`          | `24h`                                | How long dedup rows live before being purged.                        |
+| `WorkerID`          | `"default"`                          | Written into `claimed_by`. Useful for debugging.                     |
 
-### Options
-
-```go
-m := message.New(db, cfg,
-    message.WithBackoff(message.ExponentialBackoff{BaseDelay: time.Second, MaxDelay: time.Minute}),
-    message.WithMetrics(myMetrics),
-)
-```
+To override defaults at construction, see [`WithBackoff`](#example-using-a-built-in-strategy) and [`WithMetrics`](#example-prometheus-adapter).
 
 ---
 
@@ -435,21 +643,6 @@ func (l LogMetrics) OutboxFailed(et string)      { l.Logger.Error("outbox.failed
 
 ---
 
-## Errors
-
-Three sentinel errors live in [errors.go](errors.go) — see the [API summary](#sentinel-errors) for the full list. Use `errors.Is(err, message.ErrXxx)` to check.
-
-```go
-if err := m.Inbox.Receive(ctx, msg); err != nil {
-    if errors.Is(err, message.ErrDuplicate) {
-        // unreachable in practice — Receive swallows this and returns nil
-    }
-    return err
-}
-```
-
----
-
 ## Database schema
 
 Three tables are created (with the configured prefix):
@@ -474,7 +667,7 @@ Full DDL lives in [schema.go](schema.go).
 ## Lifecycle
 
 ```
-                 INBOX                                   OUTBOX
+               m.Inbox                                 m.Outbox
    ┌─────────────────────────────┐         ┌──────────────────────────────┐
    │  Receive() ─► dedup + hot   │         │  Add(tx) ─► hot (in caller's │
    │                             │         │             transaction)     │
@@ -496,17 +689,19 @@ Full DDL lives in [schema.go](schema.go).
                       max → archive(FAILED))                max → archive(FAILED))
 ```
 
-In parallel:
+In parallel, on the `m.Cleanup` side:
 
 ```
-Cleanup.PurgeExpiredDedup    — deletes expired dedup rows
-Cleanup.RecoverStuckInbox    — flips stale CLAIMED rows back to RETRY
-Cleanup.RecoverStuckOutbox
+m.Cleanup.PurgeExpiredDedup    — deletes expired dedup rows
+m.Cleanup.RecoverStuckInbox    — flips stale CLAIMED rows back to RETRY
+m.Cleanup.RecoverStuckOutbox
 ```
 
 ---
 
 ## Testing
+
+### Running the library's own tests
 
 The test suite uses [testcontainers-go](https://github.com/testcontainers/testcontainers-go) to spin up a real PostgreSQL 16 container. Docker must be running.
 
@@ -515,6 +710,30 @@ go test ./...
 ```
 
 See [testutil_test.go](testutil_test.go) for the harness.
+
+### Testing your own code that uses go-message
+
+Because `New(db, ...)` takes a plain `*sql.DB`, two patterns work:
+
+- **Integration test** — spin up a real Postgres (testcontainers, in-memory `pg`-flavored mock, or a shared CI database) and exercise `Receive` / `ProcessBatch` / `Add` / `PublishBatch` end-to-end. Recommended whenever the SQL semantics matter (claim races, dedup, archival).
+- **Unit test the closure directly** — your `Handler` and `Publisher` are plain `func(ctx, *message.Message) error`. Call them with a synthesized `*message.Message` and assert behavior; don't even involve the library. Faster, no DB needed.
+
+```go
+// Unit test pattern: the handler is the unit under test.
+func TestChargeHandler(t *testing.T) {
+    h := func(ctx context.Context, msg *message.Message) error {
+        return chargeCustomer(ctx, parseOrderID(msg.Payload))
+    }
+
+    err := h(context.Background(), &message.Message{
+        EventType: "order.created",
+        Payload:   []byte(`{"order_id":42}`),
+    })
+    if err != nil {
+        t.Fatalf("unexpected error: %v", err)
+    }
+}
+```
 
 ---
 

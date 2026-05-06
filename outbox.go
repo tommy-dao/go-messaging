@@ -31,8 +31,15 @@ func newOutbox(s *store, cfg Config, opts ...Option) *Outbox {
 
 // Add inserts an outbox event within the caller's transaction.
 // The event becomes visible only when the caller commits the transaction.
-// tx must be non-nil; use AddDirect if you don't have a business transaction.
+//
+// tx must be non-nil — passing nil panics deliberately so accidental
+// non-transactional publishes are caught loudly. Use AddDirect when you
+// genuinely have no business transaction to bind to.
 func (ob *Outbox) Add(ctx context.Context, tx Tx, evt OutboxEvent) error {
+	if tx == nil {
+		panic("message: Outbox.Add requires a non-nil tx; use AddDirect for non-transactional inserts")
+	}
+
 	maxRetries := evt.MaxRetries
 	if maxRetries <= 0 {
 		maxRetries = ob.cfg.DefaultMaxRetries
@@ -79,11 +86,11 @@ func (ob *Outbox) PublishBatch(ctx context.Context, size int, publisher Publishe
 		if err := publisher(ctx, msg); err != nil {
 			ob.handleRetry(ctx, msg, err)
 		} else {
-			now := time.Now()
-			if markErr := ob.store.markDone(ctx, msg.ID, now, "published_at"); markErr == nil {
-				_ = ob.store.archiveByID(ctx, msg.ID, "PUBLISHED")
+			if archErr := ob.store.markDoneAndArchive(ctx, msg.ID, time.Now(), "published_at", "PUBLISHED"); archErr == nil {
 				ob.metrics.OutboxPublished(msg.EventType)
 			}
+			// On archive failure the row stays CLAIMED; Cleanup.RecoverStuckOutbox
+			// will reset it and the (idempotent) publisher will run again.
 		}
 		published++
 	}
