@@ -1,4 +1,4 @@
-module github.com/tommy-dao/go-message
+module github.com/tommy-dao/go-messaging
 
 go 1.25.5
 

@@ -12,6 +12,6 @@ type DBTX interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// Tx is a type alias for *sql.Tx, used by Outbox.Add() to participate
-// in the caller's business transaction.
+// Tx is a type alias for *sql.Tx, used by Messaging.Receive() and Messaging.Enqueue()
+// to participate in the caller's business transaction.
 type Tx = *sql.Tx

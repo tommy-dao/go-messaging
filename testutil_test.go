@@ -13,7 +13,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-const testPrefix = "test"
+const testName = "test"
 
 func setupTestDB(t *testing.T) *sql.DB {
 	t.Helper()
@@ -52,11 +52,22 @@ func setupTestDB(t *testing.T) *sql.DB {
 		t.Fatalf("failed to ping db: %v", err)
 	}
 
-	if err := Migrate(ctx, db, testPrefix); err != nil {
+	if err := Migrate(ctx, db, testName); err != nil {
 		t.Fatalf("failed to migrate: %v", err)
 	}
 
 	return db
+}
+
+func newTestMessaging(t *testing.T, cfg Config, opts ...Option) *Messaging {
+	t.Helper()
+	db := setupTestDB(t)
+	cfg.Name = testName
+	m, err := New(db, cfg, opts...)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	return m
 }
 
 func countRows(t *testing.T, db *sql.DB, table string) int {

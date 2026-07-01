@@ -5,71 +5,78 @@ import (
 	"time"
 )
 
-// Direction indicates whether a message belongs to the inbox or outbox flow.
-type Direction string
-
-const (
-	DirectionInbox  Direction = "INBOX"
-	DirectionOutbox Direction = "OUTBOX"
-)
-
-// Status represents the processing state of a message in the hot table.
+// Status represents the processing state of a hot-table message.
 type Status string
 
 const (
-	StatusPending Status = "PENDING"
-	StatusClaimed Status = "CLAIMED"
-	StatusRetry   Status = "RETRY"
-	StatusDone    Status = "DONE"
-	StatusFailed  Status = "FAILED"
+	StatusPending    Status = "PENDING"
+	StatusProcessing Status = "PROCESSING"
+	StatusRetry      Status = "RETRY"
+	// StatusFailed messages stay in the hot table (acting as a DLQ) until
+	// RetryFailed/RetryOne re-queues them or ArchiveExhausted archives them
+	// after Config.FailedRetention.
+	StatusFailed Status = "FAILED"
 )
 
-// Message is the shared row representation for both hot and archive tables.
+// FinalStatus represents the terminal outcome recorded in the archive table.
+type FinalStatus string
+
+const (
+	FinalProcessed FinalStatus = "PROCESSED"
+	FinalFailed    FinalStatus = "FAILED"
+)
+
+// Message is the row representation for the hot table.
+//
+// PartitionKey is metadata only (e.g. source/scope) — it is not part of any
+// key. MessageID is the sole natural key: it drives dedup (Receive) and
+// idempotency (Enqueue) alike.
 type Message struct {
-	ID            int64
-	Direction     Direction
-	ConsumerGroup string
-	MessageID     string
-	EventID       string
-	EventType     string
-	Payload       []byte
-	Headers       map[string]string
-	Source        string
-	Status        Status
-	RetryCount    int
-	MaxRetries    int
-	NextRetryAt   *time.Time
-	ClaimedBy     *string
-	ClaimedAt     *time.Time
-	CreatedAt     time.Time
-	ProcessedAt   *time.Time
-	PublishedAt   *time.Time
-	LastError     *string
+	MessageID    string
+	PartitionKey string
+	Topic        string
+	Payload      []byte // plaintext JSON after hydration; caller-supplied JSON on write
+	Headers      map[string]string
+	Source       string
+	Encrypted    bool
+	Status       Status
+	RetryCount   int
+	MaxRetries   int
+	NextRetryAt  *time.Time
+	ProcessingBy *string
+	ProcessingAt *time.Time
+	CreatedAt    time.Time
+	ProcessedAt  *time.Time
+	LastError    *string
+
+	// rawHeaders holds the not-yet-decrypted headers JSON between claim/scan
+	// and hydrate(). Never populated once Headers has been set.
+	rawHeaders []byte
 }
 
-// InboxMessage is the input to Inbox.Receive().
-type InboxMessage struct {
-	ConsumerGroup string
-	MessageID     string
-	EventType     string
-	Payload       []byte
-	Headers       map[string]string
-	Source        string
-	MaxRetries    int // 0 means use config default
+// ArchivedMessage is the row representation for the archive table.
+// Archive is append-only: id is a surrogate key, message_id is not unique —
+// reprocessing the same message_id after a dedup TTL expiry adds a new row
+// instead of overwriting history.
+type ArchivedMessage struct {
+	ID           int64
+	MessageID    string
+	PartitionKey string
+	Topic        string
+	Payload      []byte
+	Headers      map[string]string
+	Source       string
+	Encrypted    bool
+	FinalStatus  FinalStatus
+	RetryCount   int
+	CreatedAt    time.Time
+	ProcessedAt  *time.Time
+	ArchivedAt   time.Time
+	LastError    *string
+
+	rawHeaders []byte
 }
 
-// OutboxEvent is the input to Outbox.Add().
-type OutboxEvent struct {
-	EventID    string
-	EventType  string
-	Payload    []byte
-	Headers    map[string]string
-	Source     string
-	MaxRetries int // 0 means use config default
-}
-
-// Handler processes a single inbox message. Return error to trigger retry.
+// Handler processes a single message. Return an error to trigger retry (or
+// FAILED once MaxRetries is exceeded).
 type Handler func(ctx context.Context, msg *Message) error
-
-// Publisher sends an outbox event to the broker. Return error to trigger retry.
-type Publisher func(ctx context.Context, msg *Message) error

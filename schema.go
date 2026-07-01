@@ -2,89 +2,99 @@ package message
 
 import "fmt"
 
-// Schema returns the DDL statements to create all messaging tables with the given prefix.
-// All statements use IF NOT EXISTS for idempotent migration.
-func Schema(prefix string) []string {
-	cfg := Config{TablePrefix: prefix}
-	dedup := cfg.tableName("message_dedup")
-	hot := cfg.tableName("message_hot")
-	archive := cfg.tableName("message_archive")
+// Schema returns the DDL statements to create the 3 messaging tables scoped
+// by name (e.g. name="asset" -> message_asset_hot). All statements use
+// IF NOT EXISTS for idempotent migration.
+func Schema(name string) ([]string, error) {
+	if err := assertValidName(name); err != nil {
+		return nil, err
+	}
+	dedup := tableName(name, "dedup")
+	hot := tableName(name, "hot")
+	archive := tableName(name, "archive")
 
 	return []string{
-		// Dedup table (inbox only)
+		// Dedup — receive()-only, message_id PK (global dedup).
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
-    id             BIGSERIAL PRIMARY KEY,
-    consumer_group VARCHAR(100) NOT NULL,
-    message_id     VARCHAR(255) NOT NULL,
-    event_type     VARCHAR(255) NOT NULL,
+    message_id     TEXT NOT NULL PRIMARY KEY,
+    partition_key  VARCHAR(100),
+    topic          VARCHAR(255) NOT NULL,
     source         VARCHAR(100),
-    first_received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    expire_at      TIMESTAMPTZ,
-    UNIQUE (consumer_group, message_id)
+    first_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expire_at      TIMESTAMPTZ
 )`, dedup),
 
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_%s_expire
     ON %s (expire_at) WHERE expire_at IS NOT NULL`, dedup, dedup),
 
-		// Hot table (shared inbox + outbox)
+		// Hot — live queue + DLQ (FAILED rows stay here until RetryFailed or
+		// ArchiveExhausted). message_id PK is the natural key for both
+		// receive() and enqueue() — ON CONFLICT DO NOTHING makes both idempotent.
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
-    id             BIGSERIAL PRIMARY KEY,
-    direction      VARCHAR(20) NOT NULL,
-    consumer_group VARCHAR(100),
-    message_id     VARCHAR(255) NOT NULL,
-    event_id       VARCHAR(255),
-    event_type     VARCHAR(255) NOT NULL,
+    message_id     TEXT NOT NULL PRIMARY KEY,
+    partition_key  VARCHAR(100),
+    topic          VARCHAR(255) NOT NULL,
     payload        JSONB NOT NULL,
     headers        JSONB,
     source         VARCHAR(100),
-    status         VARCHAR(30) NOT NULL,
+    encrypted      BOOLEAN NOT NULL DEFAULT false,
+    status         VARCHAR(20) NOT NULL DEFAULT 'PENDING',
     retry_count    INT NOT NULL DEFAULT 0,
     max_retry      INT NOT NULL DEFAULT 0,
     next_retry_at  TIMESTAMPTZ,
-    claimed_by     VARCHAR(100),
-    claimed_at     TIMESTAMPTZ,
+    processing_by  VARCHAR(100),
+    processing_at  TIMESTAMPTZ,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     processed_at   TIMESTAMPTZ,
-    published_at   TIMESTAMPTZ,
     last_error     TEXT
 )`, hot),
 
-		// Partial unique index for inbox dedup
-		fmt.Sprintf(`CREATE UNIQUE INDEX IF NOT EXISTS uq_%s_inbox
-    ON %s (direction, consumer_group, message_id)
-    WHERE direction = 'INBOX'`, hot, hot),
-
-		// Partial unique index for outbox dedup
-		fmt.Sprintf(`CREATE UNIQUE INDEX IF NOT EXISTS uq_%s_outbox
-    ON %s (direction, event_id)
-    WHERE direction = 'OUTBOX'`, hot, hot),
-
-		// Claim query index
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_%s_claim
-    ON %s (direction, status, next_retry_at)
+    ON %s (status, next_retry_at, created_at)
     WHERE status IN ('PENDING', 'RETRY')`, hot, hot),
 
-		// Archive table (shared)
+		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_%s_failed
+    ON %s (status, processed_at) WHERE status = 'FAILED'`, hot, hot),
+
+		// Archive — append-only, surrogate PK. message_id is intentionally
+		// NOT unique: a message_id reprocessed after a dedup TTL expiry adds
+		// a new history row instead of overwriting the previous one.
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
-    id             BIGSERIAL PRIMARY KEY,
-    direction      VARCHAR(20) NOT NULL,
-    consumer_group VARCHAR(100),
-    message_id     VARCHAR(255) NOT NULL,
-    event_id       VARCHAR(255),
-    event_type     VARCHAR(255) NOT NULL,
+    id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    message_id     TEXT NOT NULL,
+    partition_key  VARCHAR(100),
+    topic          VARCHAR(255) NOT NULL,
     payload        JSONB NOT NULL,
     headers        JSONB,
     source         VARCHAR(100),
-    final_status   VARCHAR(30) NOT NULL,
+    encrypted      BOOLEAN NOT NULL DEFAULT false,
+    final_status   VARCHAR(20) NOT NULL,
     retry_count    INT NOT NULL DEFAULT 0,
     created_at     TIMESTAMPTZ NOT NULL,
     processed_at   TIMESTAMPTZ,
-    published_at   TIMESTAMPTZ,
     archived_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_error     TEXT
 )`, archive),
 
-		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_%s_direction
-    ON %s (direction, created_at)`, archive, archive),
+		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_%s_message_id
+    ON %s (message_id)`, archive, archive),
+
+		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_%s_topic
+    ON %s (topic, created_at)`, archive, archive),
+
+		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_%s_archived
+    ON %s (archived_at)`, archive, archive),
+	}, nil
+}
+
+// dropSchema returns the DDL to drop all 3 tables for name, in dependency-safe order.
+func dropSchema(name string) ([]string, error) {
+	if err := assertValidName(name); err != nil {
+		return nil, err
 	}
+	return []string{
+		fmt.Sprintf(`DROP TABLE IF EXISTS %s`, tableName(name, "archive")),
+		fmt.Sprintf(`DROP TABLE IF EXISTS %s`, tableName(name, "hot")),
+		fmt.Sprintf(`DROP TABLE IF EXISTS %s`, tableName(name, "dedup")),
+	}, nil
 }

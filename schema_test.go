@@ -5,31 +5,28 @@ import (
 	"testing"
 )
 
-func TestSchema_WithPrefix(t *testing.T) {
-	stmts := Schema("rwa")
-
+func TestSchema_WithName(t *testing.T) {
+	stmts, err := Schema("rwa")
+	if err != nil {
+		t.Fatalf("Schema failed: %v", err)
+	}
 	if len(stmts) == 0 {
 		t.Fatal("Schema returned no statements")
 	}
 
-	// Check that all statements contain the prefix
 	for i, stmt := range stmts {
-		if !strings.Contains(stmt, "rwa_message_") {
-			t.Errorf("statement %d does not contain prefix 'rwa_message_': %s", i, stmt[:80])
+		if !strings.Contains(stmt, "message_rwa_") {
+			t.Errorf("statement %d does not contain 'message_rwa_': %s", i, stmt[:min(80, len(stmt))])
 		}
 	}
 }
 
-func TestSchema_EmptyPrefix(t *testing.T) {
-	stmts := Schema("")
-
-	for i, stmt := range stmts {
-		if strings.Contains(stmt, "_message_dedup") && !strings.Contains(stmt, "message_dedup") {
-			t.Errorf("statement %d should use 'message_dedup' without prefix: %s", i, stmt[:80])
-		}
+func TestSchema_EmptyName(t *testing.T) {
+	stmts, err := Schema("")
+	if err != nil {
+		t.Fatalf("Schema failed: %v", err)
 	}
 
-	// Verify dedup table exists
 	found := false
 	for _, stmt := range stmts {
 		if strings.Contains(stmt, "CREATE TABLE IF NOT EXISTS message_dedup") {
@@ -43,10 +40,13 @@ func TestSchema_EmptyPrefix(t *testing.T) {
 }
 
 func TestSchema_ContainsAllTables(t *testing.T) {
-	stmts := Schema("test")
+	stmts, err := Schema("test")
+	if err != nil {
+		t.Fatalf("Schema failed: %v", err)
+	}
 	joined := strings.Join(stmts, "\n")
 
-	tables := []string{"test_message_dedup", "test_message_hot", "test_message_archive"}
+	tables := []string{"message_test_dedup", "message_test_hot", "message_test_archive"}
 	for _, tbl := range tables {
 		if !strings.Contains(joined, "CREATE TABLE IF NOT EXISTS "+tbl) {
 			t.Errorf("Schema missing table: %s", tbl)
@@ -55,17 +55,44 @@ func TestSchema_ContainsAllTables(t *testing.T) {
 }
 
 func TestSchema_ContainsIndexes(t *testing.T) {
-	stmts := Schema("test")
+	stmts, err := Schema("test")
+	if err != nil {
+		t.Fatalf("Schema failed: %v", err)
+	}
 	joined := strings.Join(stmts, "\n")
 
 	indexes := []string{
-		"uq_test_message_hot_inbox",
-		"uq_test_message_hot_outbox",
-		"idx_test_message_hot_claim",
+		"idx_message_test_hot_claim",
+		"idx_message_test_hot_failed",
+		"idx_message_test_archive_message_id",
 	}
 	for _, idx := range indexes {
 		if !strings.Contains(joined, idx) {
 			t.Errorf("Schema missing index: %s", idx)
+		}
+	}
+}
+
+func TestAssertValidName(t *testing.T) {
+	cases := []struct {
+		name    string
+		wantErr bool
+	}{
+		{"", false},
+		{"asset", false},
+		{"asset_v2", false},
+		{"has space", true},
+		{"has-dash", true},
+		{strings.Repeat("a", 48), true},
+		{strings.Repeat("a", 47), false},
+	}
+	for _, c := range cases {
+		err := assertValidName(c.name)
+		if c.wantErr && err == nil {
+			t.Errorf("assertValidName(%q) = nil, want error", c.name)
+		}
+		if !c.wantErr && err != nil {
+			t.Errorf("assertValidName(%q) = %v, want nil", c.name, err)
 		}
 	}
 }
